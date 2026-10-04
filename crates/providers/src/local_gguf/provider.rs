@@ -245,9 +245,7 @@ impl LocalGgufProvider {
             .map_err(|e| anyhow::anyhow!("failed to create llama context: {e}"))?;
 
         // Tokenize prompt
-        let tokens = model
-            .str_to_token(prompt, llama_cpp_2::model::AddBos::Always)
-            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        let tokens = model.vocab().tokenize(prompt.as_bytes(), true, true);
 
         let input_tokens = tokens.len() as u32;
         debug!(input_tokens, batch_size, "tokenized prompt");
@@ -312,7 +310,7 @@ impl LocalGgufProvider {
         let token_gen_start = Instant::now();
         let mut output_tokens = Vec::new();
         let base_pos = tokens.len() as i32;
-        let eos_token = model.token_eos();
+        let eos_token = model.vocab().eos();
 
         for (i, _) in (0..max_tokens).enumerate() {
             // Sample from the last position in the batch
@@ -363,12 +361,13 @@ impl LocalGgufProvider {
 
 /// Detokenize a sequence of tokens into a string.
 fn detokenize(model: &LlamaModel, tokens: &[LlamaToken]) -> Result<String> {
+    let vocab = model.vocab();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut output = String::new();
     for &token in tokens {
-        let piece = model
-            .token_to_piece(token, &mut decoder, true, None)
-            .map_err(|e| anyhow::anyhow!("detokenization failed: {e}"))?;
+        let bytes = vocab.token_to_piece(token, true, None);
+        let mut piece = String::with_capacity(bytes.len());
+        let _ = decoder.decode_to_string(&bytes, &mut piece, false);
         output.push_str(&piece);
     }
     Ok(output)
@@ -533,9 +532,7 @@ fn stream_generate_sync(
             .map_err(|e| anyhow::anyhow!("failed to create llama context: {e}"))?;
 
         // Tokenize prompt
-        let tokens = model
-            .str_to_token(prompt, llama_cpp_2::model::AddBos::Always)
-            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        let tokens = model.vocab().tokenize(prompt.as_bytes(), true, true);
 
         let input_tokens = tokens.len() as u32;
         debug!(input_tokens, "tokenized prompt for streaming");
@@ -579,7 +576,7 @@ fn stream_generate_sync(
         let mut first_token_time: Option<std::time::Duration> = None;
         let mut output_tokens = 0u32;
         let base_pos = tokens.len() as i32;
-        let eos_token = model.token_eos();
+        let eos_token = model.vocab().eos();
         let mut decoder = encoding_rs::UTF_8.new_decoder();
 
         for (i, _) in (0..max_tokens).enumerate() {
@@ -606,9 +603,9 @@ fn stream_generate_sync(
             sampler.accept(token);
 
             // Detokenize and send
-            let piece = model
-                .token_to_piece(token, &mut decoder, true, None)
-                .map_err(|e| anyhow::anyhow!("detokenization failed: {e}"))?;
+            let bytes = model.vocab().token_to_piece(token, true, None);
+            let mut piece = String::with_capacity(bytes.len());
+            let _ = decoder.decode_to_string(&bytes, &mut piece, false);
 
             if tx.blocking_send(StreamEvent::Delta(piece)).is_err() {
                 // Receiver dropped, stop generation
