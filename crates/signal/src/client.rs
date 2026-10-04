@@ -71,9 +71,11 @@ impl SignalClient {
                 "signal-cli check failed with HTTP {status}"
             )));
         }
-        res.json::<Value>()
+        let text = res
+            .text()
             .await
-            .map_err(|e| moltis_channels::Error::external("signal-cli check json", e))
+            .map_err(|e| moltis_channels::Error::external("signal-cli check body", e))?;
+        parse_check_body(&text)
     }
 
     pub async fn stream_events(
@@ -164,5 +166,40 @@ impl SignalClient {
                 "signal-cli RPC {method} returned no result"
             ))
         })
+    }
+}
+
+/// Parse the `/api/v1/check` response body.
+///
+/// The daemon returns `200 OK` with an empty body when healthy, so empty
+/// (or whitespace-only) bodies map to an empty JSON object instead of a
+/// JSON parse error.
+fn parse_check_body(text: &str) -> moltis_channels::Result<Value> {
+    if text.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(text)
+        .map_err(|e| moltis_channels::Error::external("signal-cli check json", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_body_tolerates_empty_success_response() {
+        assert_eq!(parse_check_body("").unwrap(), json!({}));
+        assert_eq!(parse_check_body("  \n\t ").unwrap(), json!({}));
+    }
+
+    #[test]
+    fn check_body_parses_json_when_present() {
+        let value = parse_check_body(r#"{"ok":true}"#).unwrap();
+        assert_eq!(value, json!({"ok": true}));
+    }
+
+    #[test]
+    fn check_body_rejects_malformed_json() {
+        assert!(parse_check_body("not json").is_err());
     }
 }
