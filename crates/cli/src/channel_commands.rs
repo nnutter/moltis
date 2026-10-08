@@ -1,6 +1,6 @@
 //! CLI subcommands for channel configuration.
 
-use std::io::Write;
+use std::{collections::HashMap, io::Write};
 
 use {
     anyhow::{Result, anyhow},
@@ -24,6 +24,11 @@ pub enum ChannelAction {
     Teams {
         #[command(subcommand)]
         action: TeamsAction,
+    },
+    /// Signal channel helpers.
+    Signal {
+        #[command(subcommand)]
+        action: SignalAction,
     },
 }
 
@@ -78,6 +83,7 @@ pub async fn handle_channels(action: ChannelAction) -> Result<()> {
             Ok(())
         },
         ChannelAction::Teams { action } => handle_teams(action),
+        ChannelAction::Signal { action } => handle_signal(action).await,
     }
 }
 
@@ -85,6 +91,217 @@ fn handle_teams(action: TeamsAction) -> Result<()> {
     match action {
         TeamsAction::Bootstrap(args) => run_teams_bootstrap(args),
     }
+}
+
+#[derive(Subcommand)]
+pub enum SignalAction {
+    /// List groups visible to the signal-cli daemon (IDs for group_allowlist).
+    ListGroups(SignalListGroupsArgs),
+}
+
+#[derive(Args, Clone)]
+pub struct SignalListGroupsArgs {
+    /// Local signal account key from `[channels.signal.*]` (default: the only one).
+    #[arg(long)]
+    account: Option<String>,
+    /// Override the signal-cli daemon base URL.
+    #[arg(long)]
+    http_url: Option<String>,
+    /// Override the signal-cli account number (E.164).
+    #[arg(long)]
+    number: Option<String>,
+    /// Output the raw JSON group array for scripting.
+    #[arg(long, default_value_t = false)]
+    json: bool,
+}
+
+/// A Signal group as returned by the daemon's `listGroups` RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignalGroup {
+    name: Option<String>,
+    id: String,
+}
+
+async fn handle_signal(action: SignalAction) -> Result<()> {
+    match action {
+        SignalAction::ListGroups(args) => run_signal_list_groups(args).await,
+    }
+}
+
+async fn run_signal_list_groups(args: SignalListGroupsArgs) -> Result<()> {
+    let config = moltis_config::discover_and_load();
+    let (key, stored) = resolve_signal_account(&config.channels.signal, args.account.as_deref())?;
+
+    let http_url = args
+        .http_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.trim_end_matches('/').to_string())
+        .or_else(|| {
+            stored
+                .get("http_url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|v| v.trim_end_matches('/').to_string())
+        })
+        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
+    let number = args
+        .number
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            stored
+                .get("account")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "signal account '{key}' has no account number; set `account` in \
+                 [channels.signal.{key}] or pass `--number +15551234567`"
+            )
+        })?;
+
+    let groups = fetch_signal_groups(&http_url, number).await?;
+
+    if args.json {
+        let output: Vec<Value> = groups
+            .iter()
+            .map(|group| {
+                let mut obj = Map::new();
+                if let Some(name) = &group.name {
+                    obj.insert("name".into(), Value::String(name.clone()));
+                }
+                obj.insert("id".into(), Value::String(group.id.clone()));
+                Value::Object(obj)
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    print!("{}", render_signal_groups(number, &http_url, &groups));
+    Ok(())
+}
+
+fn resolve_signal_account<'a>(
+    accounts: &'a HashMap<String, Value>,
+    key: Option<&str>,
+) -> Result<(String, &'a Value)> {
+    if let Some(key) = key.map(str::trim).filter(|v| !v.is_empty()) {
+        return accounts.get(key).map_or_else(
+            || {
+                let mut known: Vec<&str> = accounts.keys().map(String::as_str).collect();
+                known.sort_unstable();
+                anyhow::bail!(
+                    "signal account '{key}' not found (known: {})",
+                    known.join(", ")
+                )
+            },
+            |stored| Ok((key.to_string(), stored)),
+        );
+    }
+    let mut iter = accounts.iter();
+    match (iter.next(), iter.next()) {
+        (None, _) => anyhow::bail!(
+            "no signal accounts configured; add a [channels.signal.<id>] section first"
+        ),
+        (Some((key, stored)), None) => Ok((key.clone(), stored)),
+        (Some(_), Some(_)) => {
+            let mut known: Vec<&str> = accounts.keys().map(String::as_str).collect();
+            known.sort_unstable();
+            anyhow::bail!(
+                "multiple signal accounts configured; pass `--account <id>` (known: {})",
+                known.join(", ")
+            )
+        },
+    }
+}
+
+async fn fetch_signal_groups(http_url: &str, number: &str) -> Result<Vec<SignalGroup>> {
+    let url = format!("{}/api/v1/rpc", http_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "listGroups",
+        "params": { "account": number },
+        "id": "moltis-list-groups",
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| anyhow!("failed to build HTTP client: {e}"))?;
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow!("cannot reach signal-cli daemon at {url}: {e}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "signal-cli RPC listGroups failed with HTTP {}",
+            resp.status()
+        );
+    }
+
+    let parsed: Value = resp.json().await?;
+    if let Some(error) = parsed.get("error") {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        anyhow::bail!("signal-cli RPC listGroups error: {message}");
+    }
+    Ok(parsed
+        .get("result")
+        .map_or_else(Vec::new, extract_signal_groups))
+}
+
+fn extract_signal_groups(result: &Value) -> Vec<SignalGroup> {
+    result.as_array().map_or_else(Vec::new, |items| {
+        items
+            .iter()
+            .filter_map(|item| {
+                let id = item.get("id")?.as_str()?.trim();
+                if id.is_empty() {
+                    return None;
+                }
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(ToString::to_string);
+                Some(SignalGroup {
+                    name,
+                    id: id.to_string(),
+                })
+            })
+            .collect()
+    })
+}
+
+fn render_signal_groups(number: &str, http_url: &str, groups: &[SignalGroup]) -> String {
+    let mut out = format!("Signal groups for account {number} (via {http_url}):\n");
+    if groups.is_empty() {
+        out.push_str("  (none)\n");
+        return out;
+    }
+    for group in groups {
+        out.push_str(&format!(
+            "  {}\n",
+            group.name.as_deref().unwrap_or("(unnamed)")
+        ));
+        out.push_str(&format!("    {}\n", group.id));
+    }
+    out.push_str(
+        "\nCopy an ID into the Signal Group Allowlist; group_policy must be 'allowlist'.\n",
+    );
+    out
 }
 
 fn run_teams_bootstrap(args: TeamsBootstrapArgs) -> Result<()> {
@@ -511,5 +728,83 @@ mod tests {
         let secret = generate_webhook_secret();
         assert_eq!(secret.len(), 48);
         assert!(secret.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    fn signal_account_map() -> HashMap<String, Value> {
+        let mut map = HashMap::new();
+        map.insert(
+            "personal".to_string(),
+            serde_json::json!({
+                "account": "+15551234567",
+                "http_url": "http://127.0.0.1:8478",
+            }),
+        );
+        map.insert(
+            "work".to_string(),
+            serde_json::json!({ "account": "+15557654321" }),
+        );
+        map
+    }
+
+    #[test]
+    fn resolve_signal_account_prefers_single_account() {
+        let mut map = HashMap::new();
+        map.insert("only".to_string(), serde_json::json!({}));
+        let (key, _) = resolve_signal_account(&map, None).unwrap();
+        assert_eq!(key, "only");
+    }
+
+    #[test]
+    fn resolve_signal_account_requires_key_when_ambiguous() {
+        let map = signal_account_map();
+        let err = resolve_signal_account(&map, None).unwrap_err();
+        assert!(err.to_string().contains("--account"), "{err}");
+        let (key, stored) = resolve_signal_account(&map, Some("work")).unwrap();
+        assert_eq!(key, "work");
+        assert_eq!(stored["account"], "+15557654321");
+    }
+
+    #[test]
+    fn resolve_signal_account_rejects_unknown_key() {
+        let map = signal_account_map();
+        let err = resolve_signal_account(&map, Some("missing")).unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        let err = resolve_signal_account(&HashMap::new(), None).unwrap_err();
+        assert!(err.to_string().contains("no signal accounts"), "{err}");
+    }
+
+    #[test]
+    fn extract_signal_groups_skips_entries_without_id() {
+        let result = serde_json::json!([
+            { "id": "ZeuFZTyfz1+Pg2dB8gNyRJeaYMLbOhEgct79OjOf07Y=", "name": "Couples Assistant" },
+            { "id": "KpxRbB8Hir3JaqmwLMLuIrIx9AbvU6Iohifo/uqBvO4=", "name": "Dates" },
+            { "name": "no id here" },
+            { "id": "  ", "name": "blank id" },
+        ]);
+        assert_eq!(extract_signal_groups(&result), vec![
+            SignalGroup {
+                name: Some("Couples Assistant".to_string()),
+                id: "ZeuFZTyfz1+Pg2dB8gNyRJeaYMLbOhEgct79OjOf07Y=".to_string(),
+            },
+            SignalGroup {
+                name: Some("Dates".to_string()),
+                id: "KpxRbB8Hir3JaqmwLMLuIrIx9AbvU6Iohifo/uqBvO4=".to_string(),
+            },
+        ]);
+        assert!(extract_signal_groups(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn render_signal_groups_lists_names_and_ids() {
+        let groups = vec![SignalGroup {
+            name: None,
+            id: "abc".to_string(),
+        }];
+        let rendered = render_signal_groups("+15551234567", "http://127.0.0.1:8478", &groups);
+        assert!(rendered.contains("+15551234567"), "{rendered}");
+        assert!(rendered.contains("(unnamed)\n    abc"), "{rendered}");
+        assert!(rendered.contains("group_policy"), "{rendered}");
+        let empty = render_signal_groups("+15551234567", "http://127.0.0.1:8478", &[]);
+        assert!(empty.contains("(none)"), "{empty}");
     }
 }

@@ -70,6 +70,27 @@ list. It is included by default.
 | `otp_cooldown_secs` | no | `300` | Cooldown after 3 failed OTP attempts |
 | `text_chunk_limit` | no | `4000` | Maximum UTF-8 bytes per outbound text chunk |
 
+## Finding Group IDs
+
+The `group_allowlist` needs Signal group IDs, not group names. List them
+with:
+
+```bash
+moltis channels signal list-groups
+moltis channels signal list-groups --account personal --json
+```
+
+The command reads the daemon URL and account number from your
+`[channels.signal.<id>]` config. Override either when needed:
+
+```bash
+moltis channels signal list-groups \
+  --http-url http://127.0.0.1:8478 \
+  --number +15551234567
+```
+
+Copy an ID into `group_allowlist` and set `group_policy = "allowlist"`.
+
 ## Current Limits
 
 Signal support currently handles text DMs and group text messages. Outbound
