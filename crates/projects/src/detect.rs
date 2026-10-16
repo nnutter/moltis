@@ -60,8 +60,46 @@ fn package_json_name(dir: &Path) -> Option<String> {
     val.get("name")?.as_str().map(String::from)
 }
 
+/// Resolve the git dir for `dir`, handling both plain repositories (a `.git`
+/// directory) and linked worktrees (a `.git` file containing `gitdir: <path>`).
+fn resolve_git_dir(dir: &Path) -> Option<PathBuf> {
+    let dotgit = dir.join(".git");
+    if dotgit.is_dir() {
+        return Some(dotgit);
+    }
+    let content = fs::read_to_string(&dotgit).ok()?;
+    let gitdir = content.strip_prefix("gitdir: ")?.trim();
+    if gitdir.is_empty() {
+        return None;
+    }
+    let gitdir = PathBuf::from(gitdir);
+    Some(if gitdir.is_relative() {
+        dir.join(gitdir)
+    } else {
+        gitdir
+    })
+}
+
 fn git_remote_name(dir: &Path) -> Option<String> {
-    let config_path = dir.join(".git").join("config");
+    let git_dir = resolve_git_dir(dir)?;
+    // Linked worktrees keep shared config in the common dir.
+    let commondir_file = git_dir.join("commondir");
+    let config_path = if let Ok(common) = fs::read_to_string(&commondir_file) {
+        let common = common.trim();
+        if common.is_empty() {
+            git_dir.join("config")
+        } else {
+            let common = PathBuf::from(common);
+            let common = if common.is_relative() {
+                git_dir.join(common)
+            } else {
+                common
+            };
+            common.join("config")
+        }
+    } else {
+        git_dir.join("config")
+    };
     let content = fs::read_to_string(config_path).ok()?;
     // Simple parse: find url = ... line under [remote "origin"]
     let mut in_origin = false;
@@ -261,6 +299,28 @@ mod tests {
         assert_eq!(p.label, "cool-proj");
         assert!(p.auto_worktree);
         assert!(p.detected);
+    }
+
+    #[test]
+    fn test_git_remote_name_linked_worktree() {
+        // Simulate `git worktree add`: `.git` is a file pointing at a
+        // per-worktree gitdir whose `commondir` holds the shared config.
+        let tmp = tempfile::tempdir().unwrap();
+        let common = tmp.path().join("common.git");
+        fs::create_dir(&common).unwrap();
+        fs::write(
+            common.join("config"),
+            "[remote \"origin\"]\n\turl = git@github.com:user/my-repo.git\n",
+        )
+        .unwrap();
+        let wt_gitdir = tmp.path().join("wt-gitdir");
+        fs::create_dir(&wt_gitdir).unwrap();
+        fs::write(wt_gitdir.join("commondir"), common.to_str().unwrap()).unwrap();
+        let wt = tmp.path().join("wt");
+        fs::create_dir(&wt).unwrap();
+        fs::write(wt.join(".git"), format!("gitdir: {}", wt_gitdir.display())).unwrap();
+
+        assert_eq!(git_remote_name(&wt).as_deref(), Some("my-repo"));
     }
 
     #[test]
