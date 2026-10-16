@@ -18,11 +18,17 @@ fn now_ms() -> u64 {
 /// Derive a human-friendly project label from a directory.
 ///
 /// Resolution order:
-/// 1. `Cargo.toml` package name
-/// 2. `package.json` name
-/// 3. Git remote origin name (last path segment)
-/// 4. Directory name
+/// 1. Timber worktree identity (`<branch>@<repo>`)
+/// 2. `Cargo.toml` package name
+/// 3. `package.json` name
+/// 4. Git remote origin name (last path segment)
+/// 5. Directory name
 pub fn derive_label(dir: &Path) -> String {
+    // Timber checkouts of one repo share manifests and remotes, so the
+    // worktree identity must win to keep labels unique.
+    if let Some((branch, repo)) = timber_identity(dir) {
+        return format!("{branch}@{repo}");
+    }
     // Try Cargo.toml
     if let Some(name) = cargo_name(dir) {
         return name;
@@ -133,12 +139,44 @@ fn git_remote_name(dir: &Path) -> Option<String> {
     None
 }
 
+/// If `dir` is a timber-managed worktree, return `(branch, repo)` — e.g.
+/// `("fix-signal", "moltis")` for `~/worktrees/moltis/fix-signal/moltis`.
+///
+/// Derived from the `.git` gitdir path (which embeds the timber repo name)
+/// and its `HEAD` (which tracks the worktree branch), so no `timber`
+/// binary is needed. Returns `None` for plain repos and detached checkouts.
+fn timber_identity(dir: &Path) -> Option<(String, String)> {
+    let git_dir = resolve_git_dir(dir)?;
+    let git_dir_str = git_dir.to_string_lossy();
+    // Timber gitdirs look like `.../timber/repos/<repo>.git/worktrees/<name>`
+    // where `<repo>` may itself contain `/` (e.g. `nnutter/moltisctl`).
+    let after_repos = git_dir_str.split("/repos/").nth(1)?;
+    let repo = after_repos.split(".git/worktrees/").next()?;
+    if repo.is_empty() {
+        return None;
+    }
+    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let branch = head.trim().strip_prefix("ref: refs/heads/")?;
+    if branch.is_empty() {
+        return None;
+    }
+    Some((branch.to_string(), repo.to_string()))
+}
+
 /// Derive a slug-friendly ID from a directory path.
+///
+/// Timber worktrees share their checkout directory name with sibling
+/// worktrees of the same repo, so their ID is slugged from the timber
+/// identity (`<branch>@<repo>`) instead.
 pub fn derive_id(dir: &Path) -> String {
-    dir.file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_lowercase()
+    if let Some((branch, repo)) = timber_identity(dir) {
+        return slugify(&format!("{branch}@{repo}"));
+    }
+    slugify(&dir.file_name().unwrap_or_default().to_string_lossy())
+}
+
+fn slugify(s: &str) -> String {
+    s.to_lowercase()
         .replace(|c: char| !c.is_alphanumeric() && c != '-', "-")
 }
 
@@ -227,9 +265,64 @@ fn scan_dirs_from_home(home: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    // Timber worktrees: ~/worktrees/<repo>/<worktree>/<checkout>. Both repo
+    // and worktree names may contain `/`, so scan recursively for git repos.
+    let timber_wt = home.join("worktrees");
+    if timber_wt.is_dir() {
+        collect_git_repos(&timber_wt, &mut out);
+    }
     out
 }
 
+/// Directory names never descended into while scanning for git repositories.
+/// Build outputs and session worktrees cannot be project roots.
+const SCAN_SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".moltis-worktrees",
+    "node_modules",
+    "target",
+    "DerivedData",
+    ".build",
+    "dist",
+];
+
+/// Depth of traversal below the scan root. Timber nests checkouts as
+/// `<repo>/<worktree>/<checkout>` where repo and worktree names may each
+/// contain `/`, so plain two-level expansion is not enough.
+const SCAN_MAX_DEPTH: usize = 8;
+
+/// Collect every git repository under `root`, including ones nested inside
+/// other checkouts. Symlinks are not followed.
+fn collect_git_repos(root: &Path, out: &mut Vec<PathBuf>) {
+    let mut stack = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_symlink()) {
+                continue;
+            }
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| SCAN_SKIP_DIRS.contains(&n))
+            {
+                continue;
+            }
+            if is_git_repo(&path) {
+                out.push(path.clone());
+            }
+            if depth + 1 < SCAN_MAX_DEPTH {
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+}
 /// Scan a list of directories and detect projects from git repos.
 /// Returns new projects not already in `known_ids`.
 pub fn auto_detect(dirs: &[&Path], known_ids: &[String]) -> Vec<Project> {
@@ -321,6 +414,112 @@ mod tests {
         fs::write(wt.join(".git"), format!("gitdir: {}", wt_gitdir.display())).unwrap();
 
         assert_eq!(git_remote_name(&wt).as_deref(), Some("my-repo"));
+    }
+
+    #[test]
+    fn test_timber_label_and_id() {
+        // Fake timber gitdir: <tmp>/repos/moltis.git/worktrees/moltis/HEAD.
+        let tmp = tempfile::tempdir().unwrap();
+        let gitdir = tmp
+            .path()
+            .join("repos")
+            .join("moltis.git")
+            .join("worktrees")
+            .join("moltis");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(gitdir.join("HEAD"), "ref: refs/heads/fix-signal\n").unwrap();
+        let wt = tmp.path().join("wt");
+        fs::create_dir(&wt).unwrap();
+        fs::write(wt.join(".git"), format!("gitdir: {}", gitdir.display())).unwrap();
+        // A Cargo.toml name must not shadow the worktree identity.
+        fs::write(wt.join("Cargo.toml"), "[package]\nname = \"moltis\"\n").unwrap();
+
+        assert_eq!(derive_label(&wt), "fix-signal@moltis");
+        assert_eq!(derive_id(&wt), "fix-signal-moltis");
+        let p = detect_project(&wt).unwrap();
+        assert_eq!(p.label, "fix-signal@moltis");
+        assert_eq!(p.id, "fix-signal-moltis");
+    }
+
+    #[test]
+    fn test_timber_slash_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gitdir = tmp
+            .path()
+            .join("repos")
+            .join("NousResearch")
+            .join("hermes-agent.git")
+            .join("worktrees")
+            .join("hermes-agent");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(
+            gitdir.join("HEAD"),
+            "ref: refs/heads/BearHuddleston/feat/desktop-web\n",
+        )
+        .unwrap();
+        let wt = tmp.path().join("wt");
+        fs::create_dir(&wt).unwrap();
+        fs::write(wt.join(".git"), format!("gitdir: {}", gitdir.display())).unwrap();
+
+        assert_eq!(
+            derive_label(&wt),
+            "BearHuddleston/feat/desktop-web@NousResearch/hermes-agent"
+        );
+        assert_eq!(
+            derive_id(&wt),
+            "bearhuddleston-feat-desktop-web-nousresearch-hermes-agent"
+        );
+    }
+
+    #[test]
+    fn test_timber_detached_head_falls_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gitdir = tmp
+            .path()
+            .join("repos")
+            .join("moltis.git")
+            .join("worktrees")
+            .join("moltis");
+        fs::create_dir_all(&gitdir).unwrap();
+        fs::write(
+            gitdir.join("HEAD"),
+            "2c1541f149d9ca2e48271efd22369577326efa97\n",
+        )
+        .unwrap();
+        let wt = tmp.path().join("my-checkout");
+        fs::create_dir(&wt).unwrap();
+        fs::write(wt.join(".git"), format!("gitdir: {}", gitdir.display())).unwrap();
+
+        assert!(timber_identity(&wt).is_none());
+        assert_eq!(derive_label(&wt), "my-checkout");
+    }
+
+    #[test]
+    fn test_scan_dirs_finds_timber_worktrees() {
+        let home = tempfile::tempdir().unwrap();
+        let mk_repo = |rel: &str| {
+            let dir = home.path().join(rel);
+            fs::create_dir_all(&dir).unwrap();
+            fs::create_dir(dir.join(".git")).unwrap();
+            dir
+        };
+        // Timber-shaped nesting: <repo>/<worktree>/<checkout>.
+        let wt_a = mk_repo("worktrees/moltis/fix-signal/moltis");
+        let wt_b = mk_repo(
+            "worktrees/NousResearch/hermes-agent/BearHuddleston/feat/desktop-web/hermes-agent",
+        );
+        // Nested checkout inside another checkout is still found.
+        let nested = mk_repo("worktrees/nnutter/moltisctl/moltisctl/moltisctl/shelleyctl");
+        // Build outputs and session worktrees are skipped.
+        mk_repo("worktrees/moltis/fix-signal/moltis/target/should-skip");
+        mk_repo("worktrees/moltis/fix-signal/moltis/.moltis-worktrees/session1");
+
+        let dirs = scan_dirs_from_home(home.path());
+        assert!(dirs.contains(&wt_a));
+        assert!(dirs.contains(&wt_b));
+        assert!(dirs.contains(&nested));
+        assert!(!dirs.iter().any(|p| p.ends_with("should-skip")));
+        assert!(!dirs.iter().any(|p| p.ends_with("session1")));
     }
 
     #[test]
