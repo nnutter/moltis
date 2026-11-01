@@ -7,6 +7,10 @@ pub enum ServiceError {
     Message { message: String },
     #[error("{message}")]
     Forbidden { message: String },
+    #[error("{message}")]
+    InvalidInput { message: String },
+    #[error("{message}")]
+    Unavailable { message: String },
     #[error("{0}")]
     Serde(#[from] serde_json::Error),
 }
@@ -22,6 +26,20 @@ impl ServiceError {
     #[must_use]
     pub fn forbidden(message: impl std::fmt::Display) -> Self {
         Self::Forbidden {
+            message: message.to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn invalid_input(message: impl std::fmt::Display) -> Self {
+        Self::InvalidInput {
+            message: message.to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn unavailable(message: impl std::fmt::Display) -> Self {
+        Self::Unavailable {
             message: message.to_string(),
         }
     }
@@ -43,6 +61,8 @@ impl From<ServiceError> for moltis_protocol::ErrorShape {
     fn from(err: ServiceError) -> Self {
         let code = match &err {
             ServiceError::Forbidden { .. } => moltis_protocol::error_codes::FORBIDDEN,
+            ServiceError::InvalidInput { .. } => moltis_protocol::error_codes::INVALID_REQUEST,
+            ServiceError::Unavailable { .. } => moltis_protocol::error_codes::UNAVAILABLE,
             _ => moltis_protocol::error_codes::INTERNAL,
         };
         Self::new(code, err.to_string())

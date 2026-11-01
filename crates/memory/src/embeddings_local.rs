@@ -138,9 +138,7 @@ fn truncate_tokens_to_context<T>(tokens: &mut Vec<T>, context_size: NonZeroU32) 
 fn embed_sync(backend: &LlamaBackend, model: &LlamaModel, text: &str) -> Result<Vec<f32>> {
     let max_context_size = embedding_context_size(model)?;
 
-    let mut tokens = model
-        .str_to_token(text, llama_cpp_2::model::AddBos::Always)
-        .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+    let mut tokens = model.vocab().tokenize(text.as_bytes(), true, true);
 
     let input_tokens = tokens.len();
     if truncate_tokens_to_context(&mut tokens, max_context_size) {
@@ -271,8 +269,8 @@ mod tests {
         .expect("default embedding model should load");
         let within_context = "Uma memória semântica em português brasileiro. ".repeat(160);
         let within_context_tokens = model
-            .str_to_token(&within_context, llama_cpp_2::model::AddBos::Always)
-            .expect("test text should tokenize");
+            .vocab()
+            .tokenize(within_context.as_bytes(), true, true);
 
         assert!(
             within_context_tokens.len() > 512,
@@ -289,9 +287,7 @@ mod tests {
         );
 
         let over_context = "Conteúdo longo para testar um limite seguro. ".repeat(600);
-        let over_context_tokens = model
-            .str_to_token(&over_context, llama_cpp_2::model::AddBos::Always)
-            .expect("oversized test text should tokenize");
+        let over_context_tokens = model.vocab().tokenize(over_context.as_bytes(), true, true);
         assert!(
             over_context_tokens.len() > model.n_ctx_train() as usize,
             "fixture must exceed the model context"
@@ -316,9 +312,7 @@ mod tests {
 
         let memory_dir = tempfile::tempdir().expect("temporary memory directory should exist");
         let garden_text = "O manjericão é uma erva aromática que cresce bem em vasos com luz suave, solo úmido e rega equilibrada. ".repeat(40);
-        let garden_tokens = model
-            .str_to_token(&garden_text, llama_cpp_2::model::AddBos::Always)
-            .expect("synthetic memory should tokenize");
+        let garden_tokens = model.vocab().tokenize(garden_text.as_bytes(), true, true);
         assert!(
             garden_tokens.len() > 512,
             "indexed fixture must reproduce the old limit"

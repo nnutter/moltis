@@ -4,7 +4,7 @@ use {
     reqwest::{Client, Response},
     serde::{Deserialize, Serialize, de::DeserializeOwned},
     serde_json::{Value, json},
-    std::time::Duration,
+    std::{error::Error as StdError, time::Duration},
     uuid::Uuid,
 };
 
@@ -59,21 +59,23 @@ impl SignalClient {
 
     pub async fn check(&self, base_url: &str) -> moltis_channels::Result<Value> {
         let url = format!("{}/api/v1/check", base_url.trim_end_matches('/'));
-        let res = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| moltis_channels::Error::external("signal-cli check", e))?;
+        let res = self.http.get(&url).send().await.map_err(|e| {
+            unavailable_with_source(
+                format!("could not reach signal-cli daemon at {url}; is the daemon running?"),
+                &e,
+            )
+        })?;
         let status = res.status();
         if !status.is_success() {
             return Err(moltis_channels::Error::unavailable(format!(
                 "signal-cli check failed with HTTP {status}"
             )));
         }
-        res.json::<Value>()
+        let text = res
+            .text()
             .await
-            .map_err(|e| moltis_channels::Error::external("signal-cli check json", e))
+            .map_err(|e| moltis_channels::Error::external("signal-cli check body", e))?;
+        parse_check_body(&text)
     }
 
     pub async fn stream_events(
@@ -89,11 +91,16 @@ impl SignalClient {
             url.query_pairs_mut().append_pair("account", account);
         }
         self.sse
-            .get(url)
+            .get(url.clone())
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .send()
             .await
-            .map_err(|e| moltis_channels::Error::external("signal-cli events", e))
+            .map_err(|e| {
+                unavailable_with_source(
+                    format!("could not reach signal-cli daemon at {url}; is the daemon running?"),
+                    &e,
+                )
+            })
     }
 
     pub async fn rpc_value(
@@ -122,13 +129,12 @@ impl SignalClient {
             id: Uuid::new_v4().to_string(),
         };
 
-        let res = self
-            .http
-            .post(url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| moltis_channels::Error::external("signal-cli rpc", e))?;
+        let res = self.http.post(&url).json(&body).send().await.map_err(|e| {
+            unavailable_with_source(
+                format!("could not reach signal-cli daemon at {url}; is the daemon running?"),
+                &e,
+            )
+        })?;
         let status = res.status();
         if !status.is_success() {
             return Err(moltis_channels::Error::unavailable(format!(
@@ -164,5 +170,68 @@ impl SignalClient {
                 "signal-cli RPC {method} returned no result"
             ))
         })
+    }
+}
+
+/// Parse the `/api/v1/check` response body.
+///
+/// The daemon returns `200 OK` with an empty body when healthy, so empty
+/// (or whitespace-only) bodies map to an empty JSON object instead of a
+/// JSON parse error.
+fn parse_check_body(text: &str) -> moltis_channels::Result<Value> {
+    if text.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(text)
+        .map_err(|e| moltis_channels::Error::external("signal-cli check json", e))
+}
+
+/// Build a retryable `Unavailable` error that preserves the full source
+/// chain.
+///
+/// `reqwest::Error`'s `Display` only shows the top-level message (e.g.
+/// "error sending request for url (...)"), hiding the root cause such
+/// as "connection refused". Walking `source()` keeps that detail in
+/// the message that reaches the logs and the UI.
+fn unavailable_with_source(prefix: String, err: &dyn StdError) -> moltis_channels::Error {
+    let mut parts = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(next) = source {
+        parts.push(next.to_string());
+        source = next.source();
+    }
+    moltis_channels::Error::unavailable(format!("{}: {}", prefix, parts.join(": ")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_body_tolerates_empty_success_response() {
+        assert_eq!(parse_check_body("").unwrap(), json!({}));
+        assert_eq!(parse_check_body("  \n\t ").unwrap(), json!({}));
+    }
+
+    #[test]
+    fn check_body_parses_json_when_present() {
+        let value = parse_check_body(r#"{"ok":true}"#).unwrap();
+        assert_eq!(value, json!({"ok": true}));
+    }
+
+    #[test]
+    fn check_body_rejects_malformed_json() {
+        assert!(parse_check_body("not json").is_err());
+    }
+
+    #[test]
+    fn unavailable_error_keeps_root_cause() {
+        let io_err =
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
+        let err = unavailable_with_source("could not reach signal-cli daemon at http://127.0.0.1:8478/api/v1/check; is the daemon running?".to_string(), &io_err);
+        let message = err.to_string();
+        assert!(message.contains("http://127.0.0.1:8478"), "{message}");
+        assert!(message.contains("connection refused"), "{message}");
+        assert!(err.is_retryable());
     }
 }

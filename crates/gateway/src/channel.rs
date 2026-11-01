@@ -19,6 +19,27 @@ use {
 
 use crate::services::{ChannelService, ServiceError, ServiceResult};
 
+/// Map a channel operation failure to a service error with a user-facing
+/// RPC code.
+///
+/// Previously every `channels.add`/`update` backend failure became
+/// `ServiceError::Message` → `INTERNAL`, so the web UI replaced the
+/// specific backend reason with "An internal server error occurred."
+/// Retryable backend failures (daemon unreachable, RPC errors) now map
+/// to `UNAVAILABLE` and input/config errors map to `INVALID_REQUEST`,
+/// letting the UI surface the actual message.
+fn channel_error_to_service(err: moltis_channels::Error) -> ServiceError {
+    match &err {
+        moltis_channels::Error::InvalidInput { .. }
+        | moltis_channels::Error::SerdeJson(_)
+        | moltis_channels::Error::ParseInt(_)
+        | moltis_channels::Error::UnknownAccount { .. } => ServiceError::invalid_input(err),
+        moltis_channels::Error::Unavailable { .. } | moltis_channels::Error::External { .. } => {
+            ServiceError::unavailable(err)
+        },
+    }
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -311,7 +332,7 @@ impl ChannelService for LiveChannelService {
             .await
             .map_err(|e| {
                 error!(error = %e, account_id, channel_type = channel_type.as_str(), "failed to start account");
-                e.to_string()
+                channel_error_to_service(e)
             })?;
 
         let now = unix_now();
@@ -355,7 +376,7 @@ impl ChannelService for LiveChannelService {
             .await
             .map_err(|e| {
                 error!(error = %e, account_id, channel_type = channel_type.as_str(), "failed to stop account");
-                e.to_string()
+                channel_error_to_service(e)
             })?;
 
         if let Err(e) = self.store.delete(channel_type.as_str(), account_id).await {
@@ -429,7 +450,7 @@ impl ChannelService for LiveChannelService {
                     },
                     Err(e) => {
                         error!(error = %e, account_id, channel_type = ct, "invalid config");
-                        return Err(e.to_string().into());
+                        return Err(channel_error_to_service(e));
                     },
                 }
             },
@@ -439,14 +460,14 @@ impl ChannelService for LiveChannelService {
                     .await
                     .map_err(|e| {
                         error!(error = %e, account_id, channel_type = ct, "failed to stop account");
-                        e.to_string()
+                        channel_error_to_service(e)
                     })?;
                 self.registry
                     .start_account(ct, account_id, config.clone())
                     .await
                     .map_err(|e| {
                         error!(error = %e, account_id, channel_type = ct, "failed to start account");
-                        e.to_string()
+                        channel_error_to_service(e)
                     })?;
             },
         }
@@ -983,8 +1004,8 @@ impl ChannelService for LiveChannelService {
 mod tests {
     use {
         super::{
-            ApprovalRole, grant_operator, merge_channel_config, otp_pending_payload,
-            parse_approval_role, sender_allowlist_key,
+            ApprovalRole, channel_error_to_service, grant_operator, merge_channel_config,
+            otp_pending_payload, parse_approval_role, sender_allowlist_key,
         },
         moltis_channels::ChannelType,
         serde_json::json,
@@ -1104,5 +1125,21 @@ mod tests {
 
         assert_eq!(payload["expires_at"], 1_234_567);
         assert_eq!(payload["code"], "954502");
+    }
+
+    #[test]
+    fn channel_errors_map_to_user_facing_codes() {
+        use moltis_protocol::{ErrorShape, error_codes};
+
+        let unavailable =
+            channel_error_to_service(moltis_channels::Error::unavailable("daemon down"));
+        let shape = ErrorShape::from(unavailable);
+        assert_eq!(shape.code, error_codes::UNAVAILABLE);
+        assert!(shape.message.contains("daemon down"), "{}", shape.message);
+
+        let invalid = channel_error_to_service(moltis_channels::Error::invalid_input("bad config"));
+        let shape = ErrorShape::from(invalid);
+        assert_eq!(shape.code, error_codes::INVALID_REQUEST);
+        assert!(shape.message.contains("bad config"), "{}", shape.message);
     }
 }

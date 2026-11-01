@@ -1,3 +1,4 @@
 [tools]
 biome     = "latest"
 git-cliff = "latest"
+just = "latest"
